@@ -1,0 +1,887 @@
+// server.js — SMC Signal Analyzer backend
+// Crypto → Binance API | Forex/Gold/Indices → Yahoo Finance (auto-detect, no key needed)
+
+require('dotenv').config();
+const express = require('express');
+const axios   = require('axios');
+const cors    = require('cors');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+const GEMINI_KEY      = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL    = 'gemini-2.5-flash';   // Free: 1500 req/day, great vision+analysis
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+
+app.use(cors());
+app.use(express.json({ limit: '15mb' }));
+
+// ── System prompt ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are an elite institutional scalp trader with 15+ years of experience trading crypto, forex, and indices using Smart Money Concepts (SMC) and ICT methodology on LOW timeframes.
+You think like a prop-desk scalper, not a swing/position trader — fast reads, tight stops, quick targets.
+Your job is to analyze the provided trading data (chart image + multi-timeframe candle data) and return ONLY high-probability SCALP trade setups.
+INPUT DATA YOU RECEIVE:
+
+1. Chart Image (5-minute timeframe screenshot from TradingView — this is your ENTRY chart)
+2. Candle Data:
+   * 1H timeframe candles (TREND)
+   * 15M timeframe candles (SETUP / CONFIRMATION)
+   * 5M timeframe candles (ENTRY)
+3. Symbol (e.g., BTCUSDT)
+4. Current Price
+5. Session (Asia / London / New York if available)
+YOUR ANALYSIS PROCESS (STRICTLY FOLLOW):
+STEP 1: MARKET STRUCTURE (MULTI-TIMEFRAME)
+
+* Identify the higher-timeframe trend on 1H (Bullish / Bearish / Ranging) — this is your directional bias, do NOT scalp against it unless there is a clear 1H liquidity sweep + CHOCH
+* On 15M, look for the SETUP: Break of Structure (BOS) or Change of Character (CHOCH) that confirms the 1H bias is playing out, or a clean reversal signal at a key level
+* On 5M, find the precise ENTRY trigger (micro BOS, CHOCH, or reaction candle) that lines up with the 15M setup and 1H trend
+STEP 2: LIQUIDITY ANALYSIS
+
+* Identify buy-side liquidity (equal highs, stop clusters) and sell-side liquidity (equal lows, stop clusters) — check all three timeframes, but weight 15M/5M most heavily since this is a scalp
+* Detect liquidity sweeps (fake breakouts / stop hunts) — these are prime scalp entry triggers on 5M
+STEP 3: ORDER FLOW & SMART MONEY
+
+* Identify Order Blocks (OB) on 15M (setup zone) and 5M (entry refinement)
+* Identify Breaker Blocks
+* Identify mitigation zones
+STEP 4: IMBALANCES
+
+* Detect Fair Value Gaps (FVG) on 15M and 5M
+* Identify inefficiencies likely to be filled within the next few candles (scalp horizon, not swing horizon)
+STEP 5: PREMIUM / DISCOUNT
+
+* Determine if price is in premium or discount zone relative to the most recent 15M/1H range
+STEP 6: SESSION CONTEXT
+
+* Consider session behavior (London killzone, NY volatility) — scalping requires active volatility, so session timing matters MORE here than on higher-timeframe trading
+* Avoid low-volume/no-liquidity times (Asia chop, off-session) unless a very clean sweep + reversal is present
+STEP 7: CONFLUENCE CHECK
+
+* Proceed with a signal if at least 2 confluences align across timeframes (e.g. 1H Trend + 15M BOS, or 15M OB + 5M CHOCH, or Liquidity Sweep + Session)
+* 3+ confluences = high confidence signal
+* 2 confluences = valid signal — DO NOT downgrade to WAIT
+* 1 confluence only = WAIT
+
+DECISION LOGIC:
+You must choose ONLY ONE:
+
+1. LONG
+2. SHORT
+3. WAIT (no trade) — use SPARINGLY, only when market is genuinely unclear
+
+TRADE RULES (SCALP-SPECIFIC):
+
+* This is a SCALP: stops must be TIGHT (based on 5M/15M structure, not 1H swings) and targets must be realistic for a short holding window (minutes to a couple hours, not days)
+* Minimum Risk:Reward = 1:1.5
+* Ideal Risk:Reward >= 1:2.5
+* If setup quality < 60% → return WAIT
+* If 1H trend is clearly established (consistent HH+HL or LH+LL) AND 15M confirms with a BOS/CHOCH AND price is at a key 5M SMC level (OB / FVG / SSL / BSL / S&R) → you MUST give a signal in the trend direction. Do NOT return WAIT.
+* WAIT is ONLY valid when: the timeframes are in conflict with no clean sweep/reversal, market is in genuine consolidation/range with no clear structure, OR price is in the middle of a range far from any key level
+* A clear trend + confirmation visible across 1H/15M is SUFFICIENT reason to trade — do not demand perfect conditions
+* Do NOT over-filter. Excessive WAIT signals are a failure of analysis, not caution.
+OUTPUT FORMAT:
+If LONG or SHORT:
+Return in this EXACT format:
+TRADE: LONG / SHORT
+ENTRY: [price]
+STOP LOSS: [price]
+TAKE PROFIT 1: [price]
+TAKE PROFIT 2: [price]
+TAKE PROFIT 3: [price]
+RISK REWARD: [e.g., 1:3]
+PROBABILITY: [0-100%]
+
+REASONING:
+
+* Market Structure:
+* Liquidity:
+* Entry Model (OB/FVG/etc):
+* Session Context:
+* Confluence Summary:
+
+If WAIT — COPY THIS EXACT FORMAT (do NOT change the labels):
+TRADE: WAIT
+REASON:
+[1-2 sentences explaining why no entry is valid right now]
+LONG SETUP:
+Trigger: [the price level OR condition that must happen before going long]
+Confirmation: [candle or structure signal required on 1H/15M]
+Entry: [price]
+Stop Loss: [price]
+Take Profit 1: [price]
+Take Profit 2: [price]
+SHORT SETUP:
+Trigger: [the price level OR condition that must happen before going short]
+Confirmation: [candle or structure signal required on 1H/15M]
+Entry: [price]
+Stop Loss: [price]
+Take Profit 1: [price]
+Take Profit 2: [price]
+WHAT TO WATCH:
+[key price levels to monitor, comma separated]
+
+HERE IS A COMPLETE EXAMPLE OF A CORRECT WAIT RESPONSE — FOLLOW THIS EXACTLY:
+TRADE: WAIT
+REASON:
+Price is consolidating inside a Fair Value Gap with no confirmed Break of Structure. Waiting for price to reach a key level with confirmation before entering.
+LONG SETUP:
+Trigger: Price pulls back to 63800 demand zone and shows reaction
+Confirmation: 15M candle closes bullish above 63850 with above-average volume
+Entry: 63900
+Stop Loss: 63400
+Take Profit 1: 64400
+Take Profit 2: 65000
+SHORT SETUP:
+Trigger: Price rallies into 64500 supply zone and fails to break above
+Confirmation: 15M candle closes bearish below 64400 after rejection
+Entry: 64450
+Stop Loss: 64800
+Take Profit 1: 64000
+Take Profit 2: 63200
+WHAT TO WATCH:
+63800 demand zone, 64500 supply zone, FVG between 64100 and 64300
+
+IMPORTANT RULES:
+
+* Think step-by-step before answering
+* Balance accuracy WITH actionability — too many WAITs is as bad as bad signals
+* Do not hallucinate levels
+* Use both image and candle data together
+* If image conflicts with data → trust candle data more
+* Only give ONE final decision
+* Be precise, not verbose
+* When the chart shows a clear trend direction, COMMIT to a signal — do not hide behind WAIT
+* A good trader reads the market and acts — not waits for perfect conditions that never come
+
+GOAL:
+Act like an experienced prop trader who needs to find trades, not avoid them. Capital preservation matters, but so does seizing clear opportunities. If the trend is obvious, trade it.`;
+
+// ── Symbol classifier ─────────────────────────────────────────────────────────
+// Returns 'binance' | 'yahoo'
+// Normalize TradingView symbol → clean Binance/Yahoo-compatible symbol
+// Handles: BINANCE:BTCUSDT.P  BYBIT:BTCUSDTPERP  OANDA:GBPUSD  COMEX:XAUUSD
+function normalizeSymbol(raw) {
+  let s = raw || '';
+
+  // 1. Strip exchange prefix:  "BINANCE:BTCUSDT.P" → "BTCUSDT.P"
+  s = s.replace(/^[A-Z0-9]+:/i, '');
+
+  // 2. Strip perpetual / futures suffixes BEFORE removing dots
+  //    These show up on Binance Futures, Bybit, OKX charts
+  s = s.replace(/\.P$/i, '');          // BTCUSDT.P  → BTCUSDT
+  s = s.replace(/\.PERP$/i, '');       // BTCUSDT.PERP → BTCUSDT
+  s = s.replace(/_PERP$/i, '');        // BTCUSDT_PERP → BTCUSDT
+  s = s.replace(/PERP$/i, '');         // BTCUSDTPERP → BTCUSDT
+  s = s.replace(/\.USD$/i, 'USDT');    // Some exchanges use .USD instead of USDT
+
+  // 3. Remove any remaining non-alphanumeric characters
+  s = s.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+
+  return s;
+}
+
+function detectDataSource(symbol) {
+  // Crypto quote currencies used on Binance
+  const cryptoSuffixes = ['USDT', 'USDC', 'BTC', 'ETH', 'BNB', 'BUSD', 'TRY', 'FDUSD'];
+  const isCrypto = cryptoSuffixes.some(s => symbol.toUpperCase().endsWith(s));
+  if (isCrypto) return 'binance';
+
+  // Known crypto base assets that might not have a standard suffix after normalization
+  const cryptoBases = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'MATIC', 'DOT', 'AVAX', 'LINK'];
+  const likelyCrypto = cryptoBases.some(b => symbol.toUpperCase().startsWith(b));
+  if (likelyCrypto) return 'binance';
+
+  // Everything else (Forex, Gold, Silver, Indices) → Yahoo Finance
+  return 'yahoo';
+}
+
+// ── Binance helpers ───────────────────────────────────────────────────────────
+async function fetchBinanceCandles(symbol, interval, limit = 65) {
+  const res = await axios.get('https://api.binance.com/api/v3/klines', {
+    params: { symbol, interval, limit },
+    timeout: 8000,
+  });
+  return res.data.map(c => ({
+    time:   new Date(c[0]).toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
+    open:   parseFloat(c[1]),
+    high:   parseFloat(c[2]),
+    low:    parseFloat(c[3]),
+    close:  parseFloat(c[4]),
+    volume: parseFloat(c[5]),
+  }));
+}
+
+async function fetchBinancePrice(symbol) {
+  const res = await axios.get('https://api.binance.com/api/v3/ticker/price', {
+    params: { symbol },
+    timeout: 5000,
+  });
+  return parseFloat(res.data.price);
+}
+
+// ── Symbol helpers ────────────────────────────────────────────────────────────
+function parseCryptoSymbol(symbol) {
+  // "BTCUSDT" → { fsym:"BTC", tsym:"USDT" }
+  const quotes = ['USDT','USDC','BUSD','FDUSD','BTC','ETH','BNB'];
+  for (const q of quotes) {
+    if (symbol.toUpperCase().endsWith(q))
+      return { fsym: symbol.slice(0, -q.length).toUpperCase(), tsym: q };
+  }
+  return { fsym: symbol.slice(0,-4).toUpperCase(), tsym: symbol.slice(-4).toUpperCase() };
+}
+
+function toHyphenSymbol(symbol) {
+  // "BTCUSDT" → "BTC-USDT"  (used by Gate.io, KuCoin, OKX)
+  const { fsym, tsym } = parseCryptoSymbol(symbol);
+  return `${fsym}-${tsym}`;
+}
+
+function toUnderscoreSymbol(symbol) {
+  // "BTCUSDT" → "BTC_USDT"  (used by Gate.io)
+  const { fsym, tsym } = parseCryptoSymbol(symbol);
+  return `${fsym}_${tsym}`;
+}
+
+// ── Exchange 2: MEXC (same Binance API format, different IPs) ─────────────────
+async function fetchMEXCCandles(symbol, interval, limit = 65) {
+  const res = await axios.get('https://api.mexc.com/api/v3/klines', {
+    params: { symbol, interval, limit },
+    timeout: 8000,
+  });
+  if (!Array.isArray(res.data) || res.data.length === 0)
+    throw new Error(`MEXC no data for ${symbol}`);
+  return res.data.map(c => ({
+    time:   new Date(c[0]).toISOString().replace('T',' ').slice(0,16) + ' UTC',
+    open:   parseFloat(c[1]),
+    high:   parseFloat(c[2]),
+    low:    parseFloat(c[3]),
+    close:  parseFloat(c[4]),
+    volume: parseFloat(c[5]),
+  }));
+}
+
+async function fetchMEXCPrice(symbol) {
+  const res = await axios.get('https://api.mexc.com/api/v3/ticker/price', {
+    params: { symbol }, timeout: 5000,
+  });
+  return parseFloat(res.data.price);
+}
+
+// ── Exchange 3: Gate.io ───────────────────────────────────────────────────────
+async function fetchGateCandles(symbol, interval, limit = 65) {
+  const barMap = { '1h':'1h', '4h':'4h', '15m':'15m', '5m':'5m', '1d':'1d' };
+  const res = await axios.get('https://api.gateio.ws/api/v4/spot/candlesticks', {
+    params: { currency_pair: toUnderscoreSymbol(symbol), interval: barMap[interval]||'1h', limit },
+    timeout: 8000,
+  });
+  if (!Array.isArray(res.data) || res.data.length === 0)
+    throw new Error(`Gate.io no data for ${symbol}`);
+  // Gate.io format: [time_sec, quote_vol, close, high, low, open]
+  return res.data.map(c => ({
+    time:   new Date(parseInt(c[0]) * 1000).toISOString().replace('T',' ').slice(0,16) + ' UTC',
+    open:   parseFloat(c[5]),
+    high:   parseFloat(c[3]),
+    low:    parseFloat(c[4]),
+    close:  parseFloat(c[2]),
+    volume: parseFloat(c[1]),
+  }));
+}
+
+async function fetchGatePrice(symbol) {
+  const res = await axios.get('https://api.gateio.ws/api/v4/spot/tickers', {
+    params: { currency_pair: toUnderscoreSymbol(symbol) }, timeout: 5000,
+  });
+  return parseFloat(res.data?.[0]?.last ?? 0);
+}
+
+// ── Exchange 4: KuCoin ────────────────────────────────────────────────────────
+async function fetchKuCoinCandles(symbol, interval, limit = 65) {
+  const typeMap = { '1h':'1hour', '4h':'4hour', '15m':'15min', '5m':'5min', '1d':'1day' };
+  // KuCoin needs startAt/endAt for limit — use endAt=now, startAt=now-limit*interval
+  const intervalSeconds = { '1h':3600, '4h':14400, '15m':900, '5m':300, '1d':86400 };
+  const endAt   = Math.floor(Date.now() / 1000);
+  const startAt = endAt - (limit + 5) * (intervalSeconds[interval] || 3600);
+
+  const res = await axios.get('https://api.kucoin.com/api/v1/market/candles', {
+    params: { symbol: toHyphenSymbol(symbol), type: typeMap[interval]||'1hour', startAt, endAt },
+    timeout: 8000,
+  });
+  const data = res.data?.data;
+  if (!data || data.length === 0) throw new Error(`KuCoin no data for ${symbol}`);
+  // KuCoin format: [time_sec, open, close, high, low, volume, amount] — newest first
+  return data.reverse().slice(-limit).map(c => ({
+    time:   new Date(parseInt(c[0]) * 1000).toISOString().replace('T',' ').slice(0,16) + ' UTC',
+    open:   parseFloat(c[1]),
+    high:   parseFloat(c[3]),
+    low:    parseFloat(c[4]),
+    close:  parseFloat(c[2]),
+    volume: parseFloat(c[5]),
+  }));
+}
+
+async function fetchKuCoinPrice(symbol) {
+  const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1`, {
+    params: { symbol: toHyphenSymbol(symbol) }, timeout: 5000,
+  });
+  return parseFloat(res.data?.data?.price ?? 0);
+}
+
+// ── Exchange 5: CryptoCompare (data aggregator, no exchange IP blocks) ────────
+async function fetchCCCandles(symbol, interval, limit = 65) {
+  const { fsym, tsym } = parseCryptoSymbol(symbol);
+
+  // 1H → histohour endpoint (native hourly candles)
+  if (interval === '1h') {
+    const res = await axios.get('https://min-api.cryptocompare.com/data/v2/histohour', {
+      params: { fsym, tsym, limit },
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 10000,
+    });
+    if (res.data.Response === 'Error') throw new Error(res.data.Message);
+    const raw = res.data?.Data?.Data || [];
+    if (raw.length === 0) throw new Error(`CryptoCompare no data for ${fsym}`);
+    return raw.map(c => ({
+      time:   new Date(c.time * 1000).toISOString().replace('T',' ').slice(0,16) + ' UTC',
+      open:   c.open, high: c.high, low: c.low, close: c.close, volume: c.volumefrom,
+    })).slice(-limit);
+  }
+
+  // 15M / 5M → histominute endpoint with aggregate param (bucket minutes into N-min candles)
+  const aggregate = interval === '15m' ? 15 : 5;
+  const res = await axios.get('https://min-api.cryptocompare.com/data/v2/histominute', {
+    params: { fsym, tsym, limit, aggregate },
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    timeout: 10000,
+  });
+  if (res.data.Response === 'Error') throw new Error(res.data.Message);
+  const raw = res.data?.Data?.Data || [];
+  if (raw.length === 0) throw new Error(`CryptoCompare no data for ${fsym}`);
+  return raw.map(c => ({
+    time:   new Date(c.time * 1000).toISOString().replace('T',' ').slice(0,16) + ' UTC',
+    open:   c.open, high: c.high, low: c.low, close: c.close, volume: c.volumefrom,
+  })).slice(-limit);
+}
+
+async function fetchCCPrice(symbol) {
+  const { fsym, tsym } = parseCryptoSymbol(symbol);
+  const res = await axios.get('https://min-api.cryptocompare.com/data/price', {
+    params: { fsym, tsyms: tsym }, headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000,
+  });
+  return res.data[tsym] ?? null;
+}
+
+// ── Master crypto fetch: tries 5 exchanges in order ──────────────────────────
+// One of these WILL work regardless of cloud provider IP restrictions.
+const CRYPTO_SOURCES = [
+  { name: 'Binance',       candles: fetchBinanceCandles, price: fetchBinancePrice },
+  { name: 'MEXC',          candles: fetchMEXCCandles,    price: fetchMEXCPrice    },
+  { name: 'Gate.io',       candles: fetchGateCandles,    price: fetchGatePrice    },
+  { name: 'KuCoin',        candles: fetchKuCoinCandles,  price: fetchKuCoinPrice  },
+  { name: 'CryptoCompare', candles: fetchCCCandles,      price: fetchCCPrice      },
+];
+
+async function fetchCryptoCandles(symbol, interval, limit = 65) {
+  const errors = [];
+  for (const src of CRYPTO_SOURCES) {
+    try {
+      const data = await src.candles(symbol, interval, limit);
+      if (data && data.length > 0) {
+        if (src.name !== 'Binance') console.log(`[Data] Using ${src.name} for ${symbol}`);
+        return data;
+      }
+    } catch (e) {
+      console.log(`[${src.name}] ${e.response?.status || ''} ${e.message}`);
+      errors.push(`${src.name}: ${e.message}`);
+    }
+  }
+  throw new Error(`All sources failed for ${symbol}:\n${errors.join('\n')}`);
+}
+
+async function fetchCryptoPrice(symbol) {
+  for (const src of CRYPTO_SOURCES) {
+    try {
+      const p = await src.price(symbol);
+      if (p && p > 0) return p;
+    } catch (_) {}
+  }
+  return null;
+}
+
+
+// ── Yahoo Finance helpers (Forex / Gold / Indices) ────────────────────────────
+//
+// Symbol mapping for Yahoo Finance:
+//   GBPUSD  → GBPUSD=X
+//   EURUSD  → EURUSD=X
+//   XAUUSD  → GC=F   (Gold Futures)
+//   XAGUSD  → SI=F   (Silver Futures)
+//   US30    → ^DJI
+//   NAS100  → ^IXIC
+//   SPX500  → ^GSPC
+//   GER40   → ^GDAXI
+//   UK100   → ^FTSE
+//
+function toYahooSymbol(symbol) {
+  const s = symbol.toUpperCase();
+  const map = {
+    'XAUUSD': 'GC=F',
+    'XAGUSD': 'SI=F',
+    'XTIUSD': 'CL=F',   // WTI Crude
+    'XBRUSD': 'BZ=F',   // Brent Crude
+    'US30':   '^DJI',
+    'DJIA':   '^DJI',
+    'NAS100': '^IXIC',
+    'NASDAQ': '^IXIC',
+    'NDX':    '^IXIC',
+    'SPX500': '^GSPC',
+    'SP500':  '^GSPC',
+    'SPX':    '^GSPC',
+    'GER40':  '^GDAXI',
+    'DAX':    '^GDAXI',
+    'UK100':  '^FTSE',
+    'FTSE':   '^FTSE',
+    'JPN225': '^N225',
+    'NI225':  '^N225',
+  };
+  if (map[s]) return map[s];
+  // Forex pairs: 6-char like GBPUSD, EURUSD → append =X
+  if (/^[A-Z]{6}$/.test(s)) return s + '=X';
+  return s + '=X';
+}
+
+// Fetch candles directly from Yahoo at a given native interval (1h / 15m / 5m)
+// Yahoo only retains intraday minute-level data for a limited lookback window,
+// so pick a `range` per interval that comfortably covers 65-70 candles + buffer.
+async function fetchYahooInterval(symbol, interval, limit = 65) {
+  const yahooSym = toYahooSymbol(symbol);
+  const rangeMap = {
+    '1h':  '15d',  // ~70+ hourly candles across the week (forex trades 24/5)
+    '15m': '5d',   // ~70+ 15-min candles within Yahoo's minute-data retention
+    '5m':  '5d',   // ~70+ 5-min candles within Yahoo's minute-data retention
+  };
+  const range = rangeMap[interval] || '5d';
+
+  const res = await axios.get(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}`,
+    {
+      params: { interval, range },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SMCAnalyzer/1.0)' },
+      timeout: 10000,
+    }
+  );
+
+  const result = res.data?.chart?.result?.[0];
+  if (!result) throw new Error(`Yahoo Finance returned no data for ${symbol}`);
+
+  const timestamps = result.timestamp || [];
+  const quote = result.indicators?.quote?.[0] || {};
+
+  const candles = timestamps
+    .map((ts, i) => ({
+      time:   new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
+      open:   quote.open?.[i]   ?? null,
+      high:   quote.high?.[i]   ?? null,
+      low:    quote.low?.[i]    ?? null,
+      close:  quote.close?.[i]  ?? null,
+      volume: quote.volume?.[i] ?? 0,
+    }))
+    .filter(c => c.open !== null && c.close !== null);
+
+  return candles.slice(-limit);
+}
+
+async function fetchYahooCandles(symbol, interval, limit = 65) {
+  return fetchYahooInterval(symbol, interval, limit);
+}
+
+async function fetchYahooPrice(symbol) {
+  // Use last close from 5M candles as current price (most up-to-date for scalp)
+  const candles = await fetchYahooInterval(symbol, '5m', 2);
+  return candles[candles.length - 1]?.close ?? null;
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+function formatCandleTable(candles, timeframe) {
+  const header = `\n${timeframe} CANDLES (last ${candles.length}):`;
+  const cols   = 'Time                 | Open           | High           | Low            | Close          | Volume';
+  const sep    = '-'.repeat(95);
+  const rows   = candles.map(c =>
+    `${c.time.padEnd(20)} | ${pad(c.open,14)} | ${pad(c.high,14)} | ${pad(c.low,14)} | ${pad(c.close,14)} | ${(c.volume||0).toFixed(2)}`
+  ).join('\n');
+  return `${header}\n${cols}\n${sep}\n${rows}`;
+}
+
+function pad(n, width = 12) {
+  return String(n ?? '—').padEnd(width);
+}
+
+function getSession() {
+  const h = new Date().getUTCHours();
+  if (h >= 0  && h < 7)  return 'Asia';
+  if (h >= 7  && h < 12) return 'London';
+  if (h >= 12 && h < 21) return 'New York';
+  return 'Off-Session';
+}
+
+// ── Signal parser — flexible regex handles Gemini's varied output style ───────
+function parseSignal(rawText) {
+  const result = { rawText };
+
+  // ── NORMALIZE: insert newlines before section headers ──
+  // Gemini often outputs everything flat on one line without line breaks.
+  // This ensures the regex-based section splitting always works.
+  const SECTIONS = [
+    'TRADE', 'REASON', 'LONG SETUP', 'SHORT SETUP',
+    'WHAT TO WATCH', 'REASONING', 'IMPORTANT',
+  ];
+  const FIELDS = [
+    'Trigger', 'Confirmation', 'Entry', 'Stop Loss',
+    'Take Profit 1', 'Take Profit 2', 'Take Profit 3',
+  ];
+
+  let text = rawText;
+
+  // Insert newline before each section header if not already on its own line
+  SECTIONS.forEach(s => {
+    const escaped = s.replace(/\s+/g, '\\s*');
+    text = text.replace(new RegExp(`([^\\n])\\s{0,3}(${escaped}\\s*:)`, 'gi'), '$1\n$2');
+  });
+
+  // Insert newline before each field label inside setup blocks
+  FIELDS.forEach(f => {
+    const escaped = f.replace(/\s+/g, '\\s*');
+    text = text.replace(new RegExp(`([^\\n])\\s{0,3}(${escaped}\\s*:)`, 'gi'), '$1\n$2');
+  });
+
+  // ── Trade direction ──
+  // Handles: "TRADE: LONG", "**TRADE:** SHORT", "Trade: WAIT", "DIRECTION: LONG"
+  const tradeMatch = text.match(/(?:TRADE|DIRECTION)[*\s:]+\*{0,2}(LONG|SHORT|WAIT)/i);
+  result.trade = tradeMatch ? tradeMatch[1].toUpperCase() : 'WAIT';
+
+  // ── Price extractor — tries multiple label patterns ──
+  const firstPrice = (...patterns) => {
+    for (const pat of patterns) {
+      const m = text.match(pat);
+      if (m?.[1]) return parseFloat(m[1].replace(/[$,\s*]/g, ''));
+    }
+    return null;
+  };
+
+  if (result.trade !== 'WAIT') {
+
+    result.entry = firstPrice(
+      /ENTRY[*\s:]+\*{0,2}\$?([\d,]+(?:\.\d+)?)/i,
+      /Entry\s*Price[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+    );
+
+    result.stopLoss = firstPrice(
+      /STOP[\s*-]*LOSS[*\s:]+\*{0,2}\$?([\d,]+(?:\.\d+)?)/i,
+      /\bSL[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /Stop[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+    );
+
+    result.tp1 = firstPrice(
+      /TAKE[\s*]*PROFIT[\s*]*1[*\s:]+\*{0,2}\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP[\s*]*1[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP1[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /Target[\s*]*1[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /1st[\s*]*(?:Take[\s*]*Profit|Target|TP)[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+    );
+
+    result.tp2 = firstPrice(
+      /TAKE[\s*]*PROFIT[\s*]*2[*\s:]+\*{0,2}\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP[\s*]*2[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP2[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /Target[\s*]*2[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /2nd[\s*]*(?:Take[\s*]*Profit|Target|TP)[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+    );
+
+    result.tp3 = firstPrice(
+      /TAKE[\s*]*PROFIT[\s*]*3[*\s:]+\*{0,2}\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP[\s*]*3[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /\bTP3[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /Target[\s*]*3[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+      /3rd[\s*]*(?:Take[\s*]*Profit|Target|TP)[*\s:]+\$?([\d,]+(?:\.\d+)?)/i,
+    );
+
+    // Risk:Reward — handles "1:3", "1:2.5", "1 : 3", "R:R 1:3"
+    const rrM = text.match(/(?:RISK[\s*/]*REWARD|R[:/]R|RR)[*\s:]+\*{0,2}([\d]+\s*[:/]\s*[\d.]+)/i);
+    if (rrM) result.riskReward = rrM[1].replace(/\s/g, '');
+
+    // Probability — handles "75%", "75", "~75%", "Probability: 75%"
+    const probM = text.match(/PROBABILITY[*\s:]+\*{0,2}~?([\d.]+)\s*%?/i);
+    if (probM) result.probability = parseFloat(probM[1]);
+
+    // Reasoning — grab everything after the label
+    const rIdx = text.search(/REASONING[*\s:]*/i);
+    if (rIdx !== -1) {
+      result.reasoning = text
+        .slice(rIdx)
+        .replace(/^REASONING[*\s:]*/i, '')
+        .trim();
+    }
+
+  } else {
+    // ── WAIT parsing — newline-independent ──
+    // Works even when Gemini returns everything flat on one line OR truncates mid-response.
+
+    // Generic section extractor — finds text between startPat and the first endPat that matches
+    const sec = (startPat, ...endPats) => {
+      const sm = text.match(startPat);
+      if (!sm) return null;
+      let chunk = text.slice(sm.index + sm[0].length);
+      for (const ep of endPats) {
+        const em = chunk.match(ep);
+        if (em) chunk = chunk.slice(0, em.index);
+      }
+      const result = chunk.trim();
+      // If result is just a single word (truncated), mark as incomplete
+      return result.length > 5 ? result : null;
+    };
+
+    // Format setup blocks — insert newlines before field labels for readability in popup
+    const fmtSetup = t => t
+      ? t.replace(/\s+(Trigger:|Confirmation:|Entry:|Stop\s*Loss:|Take\s*Profit\s*\d*:)/gi, '\n$1').trim()
+      : null;
+
+    result.reason     = sec(/REASON\s*:/i,      /\s+LONG\s*SETUP\s*:/i, /\s+SHORT\s*SETUP\s*:/i, /\s+WHAT\s*TO\s*WATCH\s*:/i);
+    result.longSetup  = fmtSetup(sec(/LONG\s*SETUP\s*:/i,  /\s+SHORT\s*SETUP\s*:/i, /\s+WHAT\s*TO\s*WATCH\s*:/i));
+    result.shortSetup = fmtSetup(sec(/SHORT\s*SETUP\s*:/i, /\s+WHAT\s*TO\s*WATCH\s*:/i));
+    result.watchFor   = sec(/WHAT\s*TO\s*WATCH\s*:/i);
+
+    // If response was truncated (shortSetup or watchFor missing), note it clearly
+    if (!result.shortSetup) {
+      result.shortSetup = '⚠ Response was cut off. Run analysis again for complete SHORT setup.';
+    }
+    if (!result.watchFor) {
+      result.watchFor = '⚠ Response was cut off. Run analysis again.';
+    }
+
+    // Clean up "HERE IS A COMPLETE EXAMPLE" if it leaked from prompt into watchFor
+    if (result.watchFor) {
+      result.watchFor = result.watchFor.replace(/HERE\s*IS.*$/is, '').trim();
+    }
+  }
+
+  return result;
+}
+
+// ── Main route ────────────────────────────────────────────────────────────────
+app.post('/analyze', async (req, res) => {
+  const { symbol, screenshot, mediaType } = req.body;
+
+  if (!symbol)     return res.status(400).json({ error: 'Missing symbol' });
+  if (!screenshot) return res.status(400).json({ error: 'Missing screenshot' });
+  if (!GEMINI_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set in environment variables.' });
+  }
+
+  // Normalize: strip exchange prefix + perpetual suffixes (.P, PERP, etc.)
+  // e.g. "BINANCE:BTCUSDT.P" → "BTCUSDT"  |  "OANDA:GBPUSD" → "GBPUSD"
+  const cleanSymbol = normalizeSymbol(symbol);
+  const dataSource  = detectDataSource(cleanSymbol);
+
+  console.log(`[Analyze] ${cleanSymbol} → source: ${dataSource}`);
+
+  // ── Fetch candle data ──
+  // Scalp mode: 1H = trend, 15M = setup/confirmation, 5M = entry
+  const CANDLE_LIMIT = 65; // 60-70 candles per timeframe for accurate trend/setup reads
+  let candles1H, candles15M, candles5M, currentPrice;
+
+  try {
+    if (dataSource === 'binance') {
+      // fetchCryptoCandles auto-falls back: Binance → MEXC → Gate.io → KuCoin → CryptoCompare
+      [candles1H, candles15M, candles5M, currentPrice] = await Promise.all([
+        fetchCryptoCandles(cleanSymbol, '1h', CANDLE_LIMIT),
+        fetchCryptoCandles(cleanSymbol, '15m', CANDLE_LIMIT),
+        fetchCryptoCandles(cleanSymbol, '5m', CANDLE_LIMIT),
+        fetchCryptoPrice(cleanSymbol),
+      ]);
+    } else {
+      // Forex / Gold / Indices → Yahoo Finance
+      [candles1H, candles15M, candles5M] = await Promise.all([
+        fetchYahooCandles(cleanSymbol, '1h', CANDLE_LIMIT),
+        fetchYahooCandles(cleanSymbol, '15m', CANDLE_LIMIT),
+        fetchYahooCandles(cleanSymbol, '5m', CANDLE_LIMIT),
+      ]);
+      currentPrice = candles5M[candles5M.length - 1]?.close ?? null;
+    }
+  } catch (err) {
+    const detail = err.response?.data?.msg || err.message;
+    console.error('[Data Fetch Error]', detail);
+
+    if (dataSource === 'binance') {
+      return res.status(400).json({
+        error: `Could not fetch candles for "${cleanSymbol}" from Binance or Bybit.\n` +
+               `Make sure the symbol is a valid spot pair (e.g. BTCUSDT, ETHUSDT, SOLUSDT).`,
+      });
+    } else {
+      return res.status(400).json({
+        error: `Could not fetch candles for "${cleanSymbol}" from Yahoo Finance.\n` +
+               `Supported forex: GBPUSD, EURUSD, USDJPY, XAUUSD. Indices: NAS100, US30, SPX500.`,
+      });
+    }
+  }
+
+  const session   = getSession();
+  const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+
+  // ── Build user message ──
+  const userText = `
+Symbol: ${cleanSymbol}
+Asset Type: ${dataSource === 'binance' ? 'Crypto (Binance/Bybit)' : 'Forex / Commodity / Index (Yahoo Finance)'}
+Current Price: ${currentPrice != null ? currentPrice : 'See chart'}
+Timestamp: ${timestamp}
+Session: ${session}
+${formatCandleTable(candles1H, '1H (TREND)')}
+${formatCandleTable(candles15M, '15M (SETUP / CONFIRMATION)')}
+${formatCandleTable(candles5M, '5M (ENTRY)')}
+
+The chart screenshot above shows the current TradingView chart (5-minute timeframe — this is the ENTRY chart for this scalp).
+Please analyze all provided data — chart image + 1H/15M/5M candles — and return your scalp trade signal.
+`.trim();
+
+  // ── Call Gemini API ──
+  if (!GEMINI_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set in environment variables.' });
+  }
+
+  let apiRes;
+  try {
+    apiRes = await axios.post(
+      `${GEMINI_BASE_URL}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        // System prompt
+        system_instruction: {
+          parts: [{ text: SYSTEM_PROMPT }]
+        },
+        // User message: image first, then candle data text
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                inline_data: {
+                  mime_type: mediaType || 'image/jpeg',
+                  data:      screenshot,
+                }
+              },
+              { text: userText }
+            ]
+          }
+        ],
+        generationConfig: {
+          maxOutputTokens: 8192,
+          temperature:     0.4,
+          topP:            0.95,
+        },
+        // Prevent safety filters blocking trading content
+        safetySettings: [
+          { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' },
+        ],
+      },
+      { timeout: 90000 }
+    );
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.response?.data || err.message;
+    console.error('[Gemini Error]', JSON.stringify(detail));
+    return res.status(502).json({ error: `Gemini API error: ${JSON.stringify(detail)}` });
+  }
+
+  // Parse Gemini response
+  const candidate  = apiRes.data?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  const rawText    = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+
+  console.log('[Gemini] finish:', finishReason, '| chars:', rawText.length, '| preview:', rawText.slice(0, 80));
+
+  if (finishReason === 'SAFETY') {
+    return res.status(502).json({ error: 'Gemini safety filter triggered. Try again.' });
+  }
+
+  if (finishReason === 'MAX_TOKENS') {
+    console.warn('[Gemini] Response hit MAX_TOKENS limit — partial response returned. Consider reducing candle count.');
+    // Don't error out — parse whatever we got, partial signal is better than nothing
+  }
+
+  if (!rawText) {
+    console.error('[Gemini] Empty response:', JSON.stringify(apiRes.data).slice(0, 400));
+    return res.status(502).json({
+      error: 'Empty response from Gemini. Check API key and billing.',
+      debug: JSON.stringify(apiRes.data).slice(0, 300),
+    });
+  }
+
+  const signal = parseSignal(rawText);
+  signal.symbol       = cleanSymbol;
+  signal.currentPrice = currentPrice;
+  signal.timestamp    = timestamp;
+  signal.session      = session;
+  signal.dataSource   = dataSource;
+  signal._raw         = rawText; // temp: remove after confirming parsing works
+
+  return res.json(signal);
+});
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    version: '4.0-scalp',
+    mode:    '1H trend / 15M setup+confirmation / 5M entry',
+    model:   GEMINI_MODEL,
+    apiKey:  GEMINI_KEY ? '✓ set' : '✗ missing',
+  });
+});
+
+// ── Test AI — open in browser to verify Gemini is working ────────────────────
+app.get('/test-ai', async (_req, res) => {
+  if (!GEMINI_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set in environment' });
+  }
+  try {
+    const r = await axios.post(
+      `${GEMINI_BASE_URL}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: 'Reply with exactly: WORKING' }] }],
+        generationConfig: { maxOutputTokens: 20 },
+      },
+      { timeout: 20000 }
+    );
+    const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return res.json({
+      test:         text ? 'PASSED ✅' : 'FAILED ❌',
+      reply:        text,
+      model:        GEMINI_MODEL,
+      finish:       r.data?.candidates?.[0]?.finishReason,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      test:  'FAILED ❌',
+      error: err.response?.data?.error?.message || err.message,
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`\n✅  SMC Scalp Signal Backend running at http://localhost:${PORT}`);
+  console.log(`    Mode:    Scalp — 1H trend / 15M setup+confirmation / 5M entry (chart = 5M)`);
+  console.log(`    Model:   ${GEMINI_MODEL}`);
+  console.log(`    Key:     ${GEMINI_KEY ? '✓ loaded' : '✗ NOT SET — add GEMINI_API_KEY to .env'}`);
+  console.log(`    Sources: Binance/MEXC/Gate.io/KuCoin/CryptoCompare (crypto) + Yahoo (forex/indices)`);
+  console.log(`    Health:  http://localhost:${PORT}/health\n`);
+});
+
+// ── Global error handlers ─────────────────────────────────────────────────────
+// Always return JSON — prevents HTML error pages reaching the extension
+app.use((req, res) => {
+  res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` });
+});
+app.use((err, req, res, _next) => {
+  console.error('[Unhandled Error]', err);
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
