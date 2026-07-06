@@ -773,7 +773,7 @@ Please analyze all provided data — chart image + 1H/15M/5M candles — and ret
         ],
         generationConfig: {
           maxOutputTokens: 8192,
-          temperature:     0.4,
+          temperature:     0.9,
           topP:            0.95,
         },
         // Prevent safety filters blocking trading content
